@@ -348,7 +348,7 @@ export class GuardianEyeOrchestrator {
       parts.push({
         functionResponse: {
           name: toolCall.name,
-          response: result,
+          content: result,
         },
       });
     }
