@@ -149,6 +149,7 @@ export class GuardianEyeOrchestrator {
   private sessionStore: SessionStore;
   private sessionId: string;
   private conversationHistory: Array<{ role: string; parts: Array<{ text?: string; functionCall?: object; functionResponse?: object }> }> = [];
+  private static readonly MAX_HISTORY_TURNS = 20; // Keep last 20 turns to avoid token OOM
 
   constructor(config: AgentConfig) {
     const vertexAI = new VertexAI({
@@ -214,6 +215,13 @@ export class GuardianEyeOrchestrator {
         });
 
         response = await this.callModel();
+      }
+
+      // Trim history to prevent unbounded growth — keep last MAX_HISTORY_TURNS user+model pairs
+      if (this.conversationHistory.length > GuardianEyeOrchestrator.MAX_HISTORY_TURNS * 2) {
+        this.conversationHistory = this.conversationHistory.slice(
+          this.conversationHistory.length - GuardianEyeOrchestrator.MAX_HISTORY_TURNS * 2
+        );
       }
 
       const finalText = response.text || "I'm analyzing the scene. One moment.";

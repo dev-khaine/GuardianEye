@@ -10,6 +10,8 @@
  * The orchestrator MUST call this before any procedural guidance.
  */
 
+import { GoogleAuth } from 'google-auth-library';
+import { VertexAI } from '@google-cloud/vertexai';
 import { logger } from '../utils/logger';
 
 export interface ManualLookupInput {
@@ -129,7 +131,7 @@ export class ManualLookupTool {
   }
 
   private async queryVertexSearch(query: string): Promise<{ chunks: string[]; sources: string[] }> {
-    const { GoogleAuth } = await import('google-auth-library');
+
     const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
     const client = await auth.getClient();
     const token = await client.getAccessToken();
@@ -190,7 +192,7 @@ export class ManualLookupTool {
     chunks: string[],
     input: ManualLookupInput
   ): Promise<Omit<ManualLookupResult, 'sources'>> {
-    const { VertexAI } = await import('@google-cloud/vertexai');
+
     const vertexAI = new VertexAI({
       project: this.projectId,
       location: process.env.VERTEX_LOCATION || 'us-central1',
@@ -236,11 +238,14 @@ Return JSON in this exact schema:
 If the chunks don't contain relevant information, return { "found": false, "steps": [], "warnings": [], "confidence": 0, "relatedTopics": [] }`;
 
     const result = await model.generateContent(prompt);
-    const text = result.response.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    const rawText = result.response.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    // Strip markdown fences Gemini sometimes wraps JSON in
+    const text = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
 
     try {
       return JSON.parse(text);
     } catch {
+      logger.warn('parseChunksToSteps: failed to parse JSON response', { rawText });
       return { found: false, steps: [], warnings: [], confidence: 0, relatedTopics: [] };
     }
   }

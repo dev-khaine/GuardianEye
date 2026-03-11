@@ -119,7 +119,9 @@ export class VisionTool {
         ],
       });
 
-      const responseText = result.response.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      const rawText = result.response.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      // Strip markdown code fences Gemini sometimes wraps JSON in
+      const responseText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
       const parsed: VisionResult = JSON.parse(responseText);
 
       const latency = Date.now() - startTime;

@@ -235,7 +235,7 @@ async function handleStartSession(
   });
 
   // Connect to Gemini Multimodal Live API
-  await connectToGeminiLive(clientWs, session, sessions);
+  await connectToGeminiLive(clientWs, session);
 
   sendToClient(clientWs, 'SESSION_READY', sessionId, {
     sessionId,
@@ -249,12 +249,13 @@ async function handleStartSession(
 
 async function connectToGeminiLive(
   clientWs: WebSocket,
-  session: SessionState,
-  sessions: Map<WebSocket, SessionState>
+  session: SessionState
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const geminiWs = new WebSocket(GEMINI_LIVE_WS_URL);
     session.geminiWs = geminiWs;
+
+    let setupTimeout: ReturnType<typeof setTimeout>;
 
     geminiWs.on('open', () => {
       logger.debug(`Gemini Live WS connected for session ${session.sessionId}`);
@@ -270,6 +271,7 @@ async function connectToGeminiLive(
         const data = JSON.parse(rawData.toString());
 
         if (data.setupComplete) {
+          clearTimeout(setupTimeout);  // Fix: prevent memory leak
           logger.info(`Gemini Live session ready: ${session.sessionId}`);
           resolve();
           return;
@@ -296,7 +298,7 @@ async function connectToGeminiLive(
     });
 
     // Timeout if setup takes too long
-    setTimeout(() => reject(new Error('Gemini Live setup timeout')), 10000);
+    setupTimeout = setTimeout(() => reject(new Error('Gemini Live setup timeout')), 10000);
   });
 }
 
