@@ -21,6 +21,11 @@ echo "  Region:   ${REGION}"
 echo "  Service:  ${SERVICE_NAME}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+# Script must be run from repo root regardless of where it lives
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 # ── Step 1: Enable Required APIs ──────────────────────────────────────────────
 echo ""
 echo "⚙️  Enabling Google Cloud APIs..."
@@ -44,7 +49,6 @@ gcloud iam service-accounts create "${SA_NAME}" \
   --display-name="GuardianEye Live Service Account" \
   --project="${PROJECT_ID}" 2>/dev/null || echo "Service account already exists."
 
-# Grant required roles
 for ROLE in \
   "roles/aiplatform.user" \
   "roles/datastore.user" \

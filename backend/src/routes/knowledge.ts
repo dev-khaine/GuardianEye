@@ -20,21 +20,3 @@ knowledgeRouter.post('/upload', upload.single('manual'), async (req, res) => {
     instructions: 'See README for Vertex AI Search datastore configuration.',
   });
 });
-
-// ── routes/health.ts ──────────────────────────────────────────────────────────
-import { Router as HealthRouter } from 'express';
-export const healthRouter = HealthRouter();
-
-healthRouter.get('/', (_req, res) => {
-  res.json({
-    status: 'healthy',
-    service: 'GuardianEye Live',
-    version: '1.0.0',
-    timestamp: new Date().toISOString(),
-    checks: {
-      geminiApiKey: Boolean(process.env.GEMINI_API_KEY),
-      vertexSearch: Boolean(process.env.VERTEX_SEARCH_DATASTORE_ID),
-      firestoreProject: Boolean(process.env.GOOGLE_CLOUD_PROJECT),
-    },
-  });
-});

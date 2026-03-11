@@ -1,6 +1,7 @@
 import { useRef, useCallback } from 'react';
 import { useGuardianStore } from '../stores/guardianStore';
 import { useAudioPlayer } from './useAudioPlayer';
+import type { SpatialAnnotation } from '../stores/guardianStore';
 
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8080/live';
 
@@ -131,8 +132,11 @@ function handleServerMessage(
       break;
 
     case 'SPATIAL_ANNOTATION':
+      // ✅ Fix: cast payload directly to SpatialAnnotation[] instead of
+      //    the broken `ReturnType<typeof store.spatialAnnotations>` which
+      //    resolved to never because spatialAnnotations is a value, not a fn.
       store.setSpatialAnnotations(
-        (message.payload.annotations as ReturnType<typeof store.spatialAnnotations>) || []
+        (message.payload.annotations as SpatialAnnotation[]) ?? []
       );
       break;
 
