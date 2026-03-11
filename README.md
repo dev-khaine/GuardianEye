@@ -66,53 +66,63 @@ GuardianEye Live combines the **Multimodal Live API** (real-time video + audio) 
 guardianeye-live/
 ├── backend/
 │   └── src/
-│       ├── server.ts               # Express + WS server entry point
+│       ├── server.ts                   # Express + WS server entry point
 │       ├── agents/
-│       │   └── orchestrator.ts     # ADK Orchestrator (main agent brain)
+│       │   └── orchestrator.ts         # ADK Orchestrator (main agent brain)
 │       ├── tools/
-│       │   ├── visionTool.ts       # Vision Specialist — spatial frame analysis
-│       │   └── manualLookupTool.ts # Manual Specialist — RAG / Vertex AI Search
+│       │   ├── visionTool.ts           # Vision Specialist — spatial frame analysis
+│       │   └── manualLookupTool.ts     # Manual Specialist — RAG / Vertex AI Search
 │       ├── routes/
-│       │   ├── websocket.ts        # Multimodal Live API WebSocket handler
-│       │   ├── session.ts          # REST: session management
-│       │   ├── knowledge.ts        # REST: manual upload endpoint
-│       │   └── health.ts           # Liveness probe
+│       │   ├── websocket.ts            # Multimodal Live API WebSocket handler
+│       │   ├── session.ts              # REST: session management
+│       │   ├── knowledge.ts            # REST: manual upload endpoint
+│       │   └── health.ts               # Liveness probe (GET /health)
 │       ├── middleware/
-│       │   ├── errorHandler.ts
-│       │   └── rateLimiter.ts
+│       │   ├── errorHandler.ts         # Express error handler
+│       │   └── rateLimiter.ts          # In-memory rate limiter (100 req/min/IP)
 │       └── utils/
-│           ├── sessionStore.ts     # Firestore persistence
-│           └── logger.ts
+│           ├── sessionStore.ts         # Firestore persistence
+│           └── logger.ts               # Winston structured logger
 │
 ├── frontend/
+│   ├── .env.local.example              # Copy to .env.local for local dev
+│   ├── tsconfig.json                   # TypeScript config
+│   ├── tsconfig.node.json              # Vite node config
 │   └── src/
-│       ├── App.tsx                 # Root layout
+│       ├── App.tsx                     # Root layout
 │       ├── components/
-│       │   ├── Viewfinder.tsx      # Live camera with status overlay
-│       │   ├── TranscriptLog.tsx   # Real-time conversation log
-│       │   ├── SpatialOverlay.tsx  # Component annotation UI
-│       │   ├── EmergencyStop.tsx   # Big red stop button
-│       │   ├── ControlBar.tsx      # Session controls + text input
-│       │   └── StatusBar.tsx       # Connection status
+│       │   ├── Viewfinder.tsx          # Live camera with status overlay
+│       │   ├── TranscriptLog.tsx       # Real-time conversation log
+│       │   ├── SpatialOverlay.tsx      # Component annotation overlay
+│       │   ├── EmergencyStop.tsx       # Persistent stop button
+│       │   ├── ControlBar.tsx          # Session controls + text input
+│       │   └── StatusBar.tsx           # Connection status pill
 │       ├── hooks/
-│       │   ├── useWebSocket.ts     # WS client + message routing
-│       │   ├── useCamera.ts        # Video capture + frame extraction
-│       │   └── useAudio.ts         # Mic recording + PCM playback
+│       │   ├── useWebSocket.ts         # WS client + message routing
+│       │   ├── useCamera.ts            # Video capture + frame extraction
+│       │   ├── useAudio.ts             # Microphone recording (VAD)
+│       │   └── useAudioPlayer.ts       # Gapless PCM playback (Web Audio API)
 │       ├── stores/
-│       │   └── guardianStore.ts    # Zustand global state
+│       │   └── guardianStore.ts        # Zustand global state
 │       └── styles/
-│           └── globals.css         # Tactical dark UI design system
+│           └── globals.css             # Tactical dark UI design system
 │
-├── agent-logic/                    # ADK prompt engineering & evaluation
+├── agent-logic/                        # ADK prompt engineering & evaluation
 │   ├── specialists/
+│   │   ├── vision.md                   # Vision Specialist docs & schema
+│   │   └── manual.md                   # Manual Specialist docs & safety contract
 │   ├── orchestrator/
-│   └── prompts/
+│   │   └── flow.md                     # Decision tree & agentic loop docs
+│   ├── prompts/
+│   │   └── system_prompts.md           # All system prompts in one place
+│   └── ARCHITECTURE.md                 # Evaluation checklist
 │
 ├── docs/
 ├── infra/
-│   └── deploy.sh                   # One-command Cloud Run deployment
+│   └── deploy.sh                       # One-command Cloud Run deployment
 │
 ├── Dockerfile
+├── .dockerignore
 ├── .env.example
 └── README.md  ← you are here
 ```
