@@ -21,6 +21,12 @@ RUN npm run build
 # ── Stage 3: Production image ──────────────────────────────────────────────
 FROM node:20-alpine AS production
 
+# ffmpeg is needed for audio transcoding (webm/opus → PCM s16le 16 kHz).
+# ffmpeg-static bundles its own binary, but having system ffmpeg as a fallback
+# is good practice and keeps the container working even if the npm binary has
+# platform compatibility issues on Alpine.
+RUN apk add --no-cache ffmpeg
+
 ENV NODE_ENV=production
 WORKDIR /app
 

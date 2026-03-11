@@ -13,6 +13,7 @@
  *   - Real-time video frame processing (1 fps for analysis, stream for context)
  *   - Session-aware conversation history via Firestore
  *   - Graceful error recovery with automatic reconnect signaling
+ *   - Audio transcoding: browser webm/opus → PCM s16le 16 kHz for Gemini Live
  */
 
 import { Server as HTTPServer } from 'http';
@@ -20,6 +21,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { GuardianEyeOrchestrator } from '../agents/orchestrator';
 import { SessionStore } from '../utils/sessionStore';
+import { AudioTranscoder } from '../utils/audioTranscoder';
 import { logger } from '../utils/logger';
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -61,6 +63,8 @@ interface SessionState {
   userId?: string;
   orchestrator: GuardianEyeOrchestrator;
   geminiWs?: WebSocket;
+  // Transcodes browser webm/opus → PCM s16le 16 kHz before sending to Gemini
+  transcoder: AudioTranscoder;
   isAgentSpeaking: boolean;
   lastFrameData?: string;
   lastFrameMime: 'image/jpeg' | 'image/webp';
@@ -168,27 +172,21 @@ async function handleClientMessage(
     case 'START_SESSION':
       await handleStartSession(clientWs, message, sessions, sessionStore);
       break;
-
     case 'AUDIO_CHUNK':
       await handleAudioChunk(clientWs, message, sessions);
       break;
-
     case 'VIDEO_FRAME':
       await handleVideoFrame(clientWs, message, sessions);
       break;
-
     case 'USER_TEXT':
       await handleUserText(clientWs, message, sessions);
       break;
-
     case 'INTERRUPT':
       await handleInterrupt(clientWs, message, sessions);
       break;
-
     case 'END_SESSION':
       await handleEndSession(clientWs, message, sessions, sessionStore);
       break;
-
     default:
       logger.warn(`Unknown message type: ${(message as ClientMessage).type}`);
   }
@@ -212,30 +210,48 @@ async function handleStartSession(
     userId,
   });
 
+  // Create a transcoder for this session.
+  // When ffmpeg produces a PCM chunk, forward it straight to Gemini Live.
+  // We capture geminiWs via a closure — it's assigned below before any audio arrives.
   const session: SessionState = {
     sessionId,
     userId,
     orchestrator,
+    transcoder: null as unknown as AudioTranscoder, // assigned right below
     isAgentSpeaking: false,
     lastFrameMime: 'image/jpeg',
     frameBuffer: [],
     interruptRequested: false,
     turnId: uuidv4(),
-    analysisThrottleMs: 2000,  // Max 1 full analysis per 2 seconds
+    analysisThrottleMs: 2000,
     lastAnalysisTime: 0,
   };
 
+  // Wire transcoder output → Gemini Live input
+  session.transcoder = new AudioTranscoder(sessionId, (pcmBase64: string) => {
+    if (session.geminiWs?.readyState === WebSocket.OPEN) {
+      session.geminiWs.send(JSON.stringify({
+        realtimeInput: {
+          mediaChunks: [{
+            mimeType: 'audio/pcm;rate=16000',  // ✅ correct format for Gemini Live
+            data: pcmBase64,
+          }],
+        },
+      }));
+    }
+  });
+
   sessions.set(clientWs, session);
 
-  // Persist session to Firestore
   await sessionStore.createSession(sessionId, {
     userId,
     startedAt: new Date(),
     status: 'active',
   });
 
-  // Connect to Gemini Multimodal Live API
+  // Connect to Gemini first, then start the transcoder
   await connectToGeminiLive(clientWs, session);
+  session.transcoder.start();
 
   sendToClient(clientWs, 'SESSION_READY', sessionId, {
     sessionId,
@@ -259,11 +275,7 @@ async function connectToGeminiLive(
 
     geminiWs.on('open', () => {
       logger.debug(`Gemini Live WS connected for session ${session.sessionId}`);
-
-      // Send initial BidiGenerateContent setup message
-      geminiWs.send(JSON.stringify({
-        setup: GEMINI_SESSION_CONFIG,
-      }));
+      geminiWs.send(JSON.stringify({ setup: GEMINI_SESSION_CONFIG }));
     });
 
     geminiWs.on('message', async (rawData: Buffer) => {
@@ -271,14 +283,13 @@ async function connectToGeminiLive(
         const data = JSON.parse(rawData.toString());
 
         if (data.setupComplete) {
-          clearTimeout(setupTimeout);  // Fix: prevent memory leak
+          clearTimeout(setupTimeout);
           logger.info(`Gemini Live session ready: ${session.sessionId}`);
           resolve();
           return;
         }
 
         await handleGeminiMessage(clientWs, session, data);
-
       } catch (error) {
         logger.error('Failed to handle Gemini message:', error);
       }
@@ -297,7 +308,6 @@ async function connectToGeminiLive(
       logger.info(`Gemini Live WS closed for session ${session.sessionId}`);
     });
 
-    // Timeout if setup takes too long
     setupTimeout = setTimeout(() => reject(new Error('Gemini Live setup timeout')), 10000);
   });
 }
@@ -309,13 +319,10 @@ async function handleGeminiMessage(
   session: SessionState,
   data: Record<string, unknown>
 ): Promise<void> {
-
-  // ── Audio output chunks ──────────────────────────────────────────────────
   if (data.serverContent) {
     const serverContent = data.serverContent as Record<string, unknown>;
 
     if (serverContent.interrupted) {
-      // Gemini acknowledged the interrupt
       session.isAgentSpeaking = false;
       sendToClient(clientWs, 'AGENT_INTERRUPTED', session.sessionId, {
         turnId: session.turnId,
@@ -326,11 +333,9 @@ async function handleGeminiMessage(
     if (serverContent.modelTurn) {
       const modelTurn = serverContent.modelTurn as Record<string, unknown>;
       session.isAgentSpeaking = true;
-
       const parts = (modelTurn.parts as Array<Record<string, unknown>>) || [];
 
       for (const part of parts) {
-        // Audio chunk — stream immediately for low latency
         if (part.inlineData) {
           const inlineData = part.inlineData as Record<string, unknown>;
           if (session.interruptRequested) break;
@@ -342,7 +347,6 @@ async function handleGeminiMessage(
           });
         }
 
-        // Text chunk — update transcript
         if (part.text) {
           sendToClient(clientWs, 'AGENT_TEXT', session.sessionId, {
             text: part.text,
@@ -353,7 +357,6 @@ async function handleGeminiMessage(
       }
     }
 
-    // Turn complete — agent finished speaking
     if (serverContent.turnComplete) {
       session.isAgentSpeaking = false;
       session.interruptRequested = false;
@@ -365,11 +368,6 @@ async function handleGeminiMessage(
       });
     }
   }
-
-  // ── Voice Activity Detection ──────────────────────────────────────────────
-  if ((data as Record<string, unknown>).usageMetadata) {
-    // Can be used for analytics/billing tracking
-  }
 }
 
 // ── Audio Input Handler ───────────────────────────────────────────────────────
@@ -380,27 +378,22 @@ async function handleAudioChunk(
   sessions: Map<WebSocket, SessionState>
 ): Promise<void> {
   const session = sessions.get(clientWs);
-  if (!session?.geminiWs || session.geminiWs.readyState !== WebSocket.OPEN) return;
+  if (!session) return;
 
   const audioData = message.payload?.data as string;
   if (!audioData) return;
 
-  // Check for interrupt phrases in real-time (VAD-triggered)
+  // Check for interrupt phrases from a partial VAD transcript
   const transcript = message.payload?.transcript as string | undefined;
   if (transcript && isInterruptPhrase(transcript)) {
     await triggerInterrupt(clientWs, session);
     return;
   }
 
-  // Stream audio directly to Gemini Live
-  session.geminiWs.send(JSON.stringify({
-    realtimeInput: {
-      mediaChunks: [{
-        mimeType: 'audio/pcm;rate=16000',
-        data: audioData,
-      }],
-    },
-  }));
+  // Decode base64 → raw webm buffer and feed into the transcoder.
+  // The transcoder converts to PCM and calls the Gemini-forwarding callback.
+  const webmBuffer = Buffer.from(audioData, 'base64');
+  session.transcoder.write(webmBuffer);
 }
 
 // ── Video Frame Handler ───────────────────────────────────────────────────────
@@ -415,30 +408,24 @@ async function handleVideoFrame(
 
   const frameData = message.payload?.data as string;
   const mimeType = (message.payload?.mimeType as 'image/jpeg' | 'image/webp') || 'image/jpeg';
-
   if (!frameData) return;
 
-  // Always update the latest frame reference
   session.lastFrameData = frameData;
   session.lastFrameMime = mimeType;
 
-  // Stream frame to Gemini Live API for continuous context
+  // Stream frame to Gemini Live for continuous visual context
   if (session.geminiWs?.readyState === WebSocket.OPEN) {
     session.geminiWs.send(JSON.stringify({
       realtimeInput: {
-        mediaChunks: [{
-          mimeType,
-          data: frameData,
-        }],
+        mediaChunks: [{ mimeType, data: frameData }],
       },
     }));
   }
 
-  // Throttled deep analysis via ADK orchestrator (avoids overloading)
+  // Throttled deep analysis via ADK orchestrator
   const now = Date.now();
   if (now - session.lastAnalysisTime > session.analysisThrottleMs && session.lastFrameData) {
     session.lastAnalysisTime = now;
-    // Run analysis in background — don't await, don't block frame streaming
     runBackgroundAnalysis(clientWs, session).catch(err =>
       logger.error('Background analysis error:', err)
     );
@@ -459,7 +446,6 @@ async function runBackgroundAnalysis(
     timestamp: Date.now(),
   });
 
-  // Send spatial annotations to the UI for overlay rendering
   if (result.spatialAnnotations && result.spatialAnnotations.length > 0) {
     sendToClient(clientWs, 'SPATIAL_ANNOTATION', session.sessionId, {
       annotations: result.spatialAnnotations,
@@ -467,7 +453,6 @@ async function runBackgroundAnalysis(
     });
   }
 
-  // Surface safety alerts immediately
   if (result.text?.includes('⚠️ SAFETY ALERT')) {
     sendToClient(clientWs, 'SAFETY_ALERT', session.sessionId, {
       message: result.text,
@@ -489,13 +474,11 @@ async function handleUserText(
   const text = message.payload?.text as string;
   if (!text?.trim()) return;
 
-  // Check for interrupt keywords in text input
   if (isInterruptPhrase(text)) {
     await triggerInterrupt(clientWs, session);
     return;
   }
 
-  // If we have a recent frame, trigger ADK orchestration for grounded response
   if (session.lastFrameData) {
     const result = await session.orchestrator.processInput({
       imageData: session.lastFrameData,
@@ -504,21 +487,16 @@ async function handleUserText(
       userQuery: text,
     });
 
-    // Inject the grounded result into Gemini for TTS
     session.geminiWs.send(JSON.stringify({
       clientContent: {
-        turns: [{
-          role: 'user',
-          parts: [{ text }],
-        }, {
-          role: 'model',
-          parts: [{ text: result.text }],
-        }],
+        turns: [
+          { role: 'user',  parts: [{ text }] },
+          { role: 'model', parts: [{ text: result.text }] },
+        ],
         turnComplete: false,
       },
     }));
 
-    // Surface source documents if any
     if (result.sourceDocuments && result.sourceDocuments.length > 0) {
       sendToClient(clientWs, 'TRANSCRIPT_UPDATE', session.sessionId, {
         sources: result.sourceDocuments,
@@ -526,7 +504,6 @@ async function handleUserText(
       });
     }
   } else {
-    // No frame — send text directly
     session.geminiWs.send(JSON.stringify({
       clientContent: {
         turns: [{ role: 'user', parts: [{ text }] }],
@@ -536,7 +513,7 @@ async function handleUserText(
   }
 }
 
-// ── Interrupt Handling (Barge-in) ─────────────────────────────────────────────
+// ── Interrupt Handling ────────────────────────────────────────────────────────
 
 async function handleInterrupt(
   clientWs: WebSocket,
@@ -554,9 +531,7 @@ async function triggerInterrupt(clientWs: WebSocket, session: SessionState): Pro
   logger.info(`Barge-in interrupt triggered for session ${session.sessionId}`);
   session.interruptRequested = true;
 
-  // Signal Gemini to stop generation
   if (session.geminiWs?.readyState === WebSocket.OPEN) {
-    // Send empty client content to trigger model interruption
     session.geminiWs.send(JSON.stringify({
       clientContent: {
         turns: [{ role: 'user', parts: [{ text: '' }] }],
@@ -600,6 +575,9 @@ async function handleEndSession(
 }
 
 function teardownSession(session: SessionState): void {
+  // Destroy ffmpeg transcoder process first
+  session.transcoder?.destroy();
+
   if (session.geminiWs?.readyState === WebSocket.OPEN) {
     session.geminiWs.close(1000, 'Session ended');
   }
@@ -615,12 +593,6 @@ function sendToClient(
 ): void {
   if (ws.readyState !== WebSocket.OPEN) return;
 
-  const message: ServerMessage = {
-    type,
-    sessionId,
-    payload,
-    timestamp: Date.now(),
-  };
-
+  const message: ServerMessage = { type, sessionId, payload, timestamp: Date.now() };
   ws.send(JSON.stringify(message));
 }

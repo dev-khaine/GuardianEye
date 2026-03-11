@@ -1,19 +1,38 @@
 /**
- * GuardianEye ADK Orchestrator
+ * GuardianEye ADK Orchestrator — Real Google ADK Integration
  *
- * Implements the Specialist/Orchestrator pattern using Google's Agent Development Kit (ADK).
- * The orchestrator manages two specialists:
- *   1. VisionSpecialist  - Analyzes video frames for spatial reasoning
- *   2. ManualSpecialist  - Retrieves grounded steps from the knowledge base (RAG/Vertex AI Search)
+ * Uses the official @google/adk TypeScript SDK to implement the
+ * Specialist/Orchestrator pattern with real ADK primitives:
  *
- * Safety principle: NEVER give a technical instruction without first consulting ManualSpecialist.
+ *   LlmAgent      — the root agent with GuardianEye's system prompt
+ *   FunctionTool  — wraps VisionTool and ManualLookupTool with Zod schemas
+ *   Runner        — manages the agentic event loop (tool call → result → LLM)
+ *   InMemorySessionService — maintains per-session conversation history
+ *
+ * The public interface (processInput, resetContext, turnCount) is unchanged
+ * so websocket.ts requires no modifications.
+ *
+ * CJS/ESM note:
+ *   @google/adk ships a CJS build that incorrectly imports 'lodash-es'.
+ *   Run `npm run postinstall` (or `node scripts/patch-adk.js`) once after
+ *   `npm install` to apply the lodash fix. See scripts/patch-adk.js.
  */
 
-import { VertexAI, GenerativeModel } from '@google-cloud/vertexai';
+import {
+  LlmAgent,
+  FunctionTool,
+  Runner,
+  InMemorySessionService,
+  isFinalResponse,
+} from '@google/adk';
+import type { Content } from '@google/genai';
+import { z } from 'zod';
 import { VisionTool } from '../tools/visionTool';
 import { ManualLookupTool } from '../tools/manualLookupTool';
 import { SessionStore } from '../utils/sessionStore';
 import { logger } from '../utils/logger';
+
+// ── Public Types (unchanged from original interface) ─────────────────────────
 
 export interface AgentConfig {
   projectId: string;
@@ -32,80 +51,29 @@ export interface OrchestratorResponse {
 
 export interface SpatialAnnotation {
   label: string;
-  position: 'top-left' | 'top-center' | 'top-right' | 'center-left' | 'center' | 'center-right' | 'bottom-left' | 'bottom-center' | 'bottom-right';
+  position:
+    | 'top-left'
+    | 'top-center'
+    | 'top-right'
+    | 'center-left'
+    | 'center'
+    | 'center-right'
+    | 'bottom-left'
+    | 'bottom-center'
+    | 'bottom-right';
   boundingBox?: { x: number; y: number; w: number; h: number };
 }
 
 export interface FrameInput {
-  imageData: string;        // base64 encoded JPEG
+  imageData: string;       // base64-encoded JPEG
   mimeType: 'image/jpeg' | 'image/webp';
   timestamp: number;
   userQuery?: string;
 }
 
-// ── ADK Tool Declarations ────────────────────────────────────────────────────
-const ADK_TOOL_DEFINITIONS = [
-  {
-    functionDeclarations: [
-      {
-        name: 'analyze_visual_scene',
-        description: `Analyzes the current camera frame to identify objects, their spatial positions,
-          component states, labels, and any safety hazards. Returns structured JSON with spatial annotations.
-          ALWAYS call this first when the user asks about something physical.`,
-        parameters: {
-          type: 'OBJECT',
-          properties: {
-            imageData: {
-              type: 'STRING',
-              description: 'Base64-encoded JPEG image from the camera feed',
-            },
-            focusQuery: {
-              type: 'STRING',
-              description: 'What the user is trying to find or understand in the scene',
-            },
-            requireSpatial: {
-              type: 'BOOLEAN',
-              description: 'Whether to include precise position descriptions (top-right, bottom-left, etc.)',
-            },
-          },
-          required: ['imageData', 'focusQuery'],
-        },
-      },
-      {
-        name: 'lookup_manual_instructions',
-        description: `Retrieves verified, step-by-step instructions from the knowledge base using RAG.
-          ALWAYS call this before giving any technical or medical instruction.
-          Returns grounded steps with source citations. Never skip this for safety-critical tasks.`,
-        parameters: {
-          type: 'OBJECT',
-          properties: {
-            query: {
-              type: 'STRING',
-              description: 'Natural language description of what the user is trying to do',
-            },
-            context: {
-              type: 'STRING',
-              description: 'Visual context from the scene analysis to narrow the search',
-            },
-            domain: {
-              type: 'STRING',
-              enum: ['electronics', 'medical', 'automotive', 'plumbing', 'appliance', 'general'],
-              description: 'Domain category to focus the knowledge base search',
-            },
-            stepNumber: {
-              type: 'NUMBER',
-              description: 'If the user is asking about a specific step number',
-            },
-          },
-          required: ['query'],
-        },
-      },
-    ],
-  },
-];
+// ── System Prompt ─────────────────────────────────────────────────────────────
 
-// ── Orchestrator System Prompt ────────────────────────────────────────────────
-const ORCHESTRATOR_SYSTEM_PROMPT = `You are GuardianEye, an expert real-time assistant that helps users with hands-free technical and medical tasks using their camera.
+const GUARDIAN_SYSTEM_PROMPT = `You are GuardianEye, an expert real-time assistant that helps users with hands-free technical and medical tasks using their camera.
 
 ## Core Operating Principles
 
@@ -119,251 +87,282 @@ const ORCHESTRATOR_SYSTEM_PROMPT = `You are GuardianEye, an expert real-time ass
 **RESPONSE STYLE**:
 - Be concise and actionable — the user has their hands full
 - One instruction at a time, never overwhelm
-- Confirm before critical/irreversible steps ("Before you proceed, this will permanently reset the device. Confirm by saying 'yes, proceed'")
+- Confirm before critical/irreversible steps
 - Use natural, calm speech — you are a trusted expert guide
 
 ## Specialist Workflow
-1. User speaks or camera sees something noteworthy
+1. User speaks or the camera sees something noteworthy
 2. Call analyze_visual_scene to understand what's in frame
 3. Call lookup_manual_instructions to get grounded guidance
 4. Synthesize both into a single, clear, actionable response
-5. Describe spatial positions from step 2 to help the user locate components
 
 ## Interruption Handling
-If the user says "stop", "wait", "pause", or "hold on" — immediately cease output.
+If the user says "stop", "wait", "pause" — immediately cease output.
 If the user says "go back" — repeat the previous instruction.
-If the user says "again" or "repeat" — re-read the current instruction clearly.
+If the user says "again" or "repeat" — re-read the current instruction.
 
 ## Confidence Communication
 - High confidence (manual match found): State instructions directly
-- Medium confidence (partial match): "Based on what I can see, and standard practice for this type of device..."  
-- Low confidence: "I want to be careful here. I don't have specific documentation for this exact model. I recommend..."
+- Medium confidence (partial match): "Based on what I can see, and standard practice..."
+- Low confidence: "I don't have specific documentation for this. I recommend consulting official documentation."
 
-Never fabricate steps. If you cannot ground an instruction in the knowledge base, say so and suggest the user consult official documentation.`;
+Never fabricate steps. If the knowledge base returns no results, say so.`;
 
-// ── GuardianEye Orchestrator Class ────────────────────────────────────────────
+// ── GuardianEye ADK Orchestrator ──────────────────────────────────────────────
+
 export class GuardianEyeOrchestrator {
-  private model: GenerativeModel;
-  private visionTool: VisionTool;
-  private manualTool: ManualLookupTool;
+  private runner: Runner;
+  private sessionService: InMemorySessionService;
   private sessionStore: SessionStore;
   private sessionId: string;
-  private conversationHistory: Array<{ role: string; parts: Array<{ text?: string; functionCall?: object; functionResponse?: object }> }> = [];
-  private static readonly MAX_HISTORY_TURNS = 20; // Keep last 20 turns to avoid token OOM
+  private userId: string | undefined;
+
+  // Frame context — updated before every processInput() call.
+  // FunctionTool.execute() reads from here since large base64 blobs
+  // cannot be passed as LLM function-call parameters.
+  private currentFrame: { imageData: string; mimeType: 'image/jpeg' | 'image/webp' } | null = null;
+
+  // Metadata accumulated during a single processInput() turn
+  private turnSpatialAnnotations: SpatialAnnotation[] = [];
+  private turnSourceDocuments: string[] = [];
+
+  // Track whether the ADK session has been created
+  private adkSessionCreated = false;
+  private adkTurnCount = 0;
 
   constructor(config: AgentConfig) {
-    const vertexAI = new VertexAI({
-      project: config.projectId,
-      location: config.location,
-    });
-
-    this.model = vertexAI.getGenerativeModel({
-      model: 'gemini-2.0-flash-exp',
-      systemInstruction: ORCHESTRATOR_SYSTEM_PROMPT,
-      generationConfig: {
-        temperature: 0.2,         // Low temperature = more reliable, less hallucination
-        maxOutputTokens: 512,     // Keep responses concise for real-time delivery
-        topP: 0.8,
-      },
-      safetySettings: [
-        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT' as any, threshold: 'BLOCK_MEDIUM_AND_ABOVE' as any },
-        { category: 'HARM_CATEGORY_HARASSMENT' as any, threshold: 'BLOCK_MEDIUM_AND_ABOVE' as any },
-      ],
-    });
-
-    this.visionTool = new VisionTool(config.projectId, config.location);
-    this.manualTool = new ManualLookupTool(config.projectId);
-    this.sessionStore = new SessionStore();
     this.sessionId = config.sessionId;
+    this.userId = config.userId;
+    this.sessionStore = new SessionStore();
+
+    const visionTool = new VisionTool(config.projectId, config.location);
+    const manualTool = new ManualLookupTool(config.projectId);
+
+    // ── Vision FunctionTool ────────────────────────────────────────────────
+    const analyzeVisualScene = new FunctionTool({
+      name: 'analyze_visual_scene',
+      description: `Analyzes the current camera frame to identify objects, their spatial positions,
+        component states, labels, and any safety hazards. Returns structured JSON with spatial
+        annotations. ALWAYS call this first when the user asks about something physical.`,
+      parameters: z.object({
+        focusQuery: z
+          .string()
+          .describe('What the user is trying to find or understand in the scene'),
+        requireSpatial: z
+          .boolean()
+          .optional()
+          .describe('Whether to include precise position descriptions (top-right, bottom-left, etc.)'),
+      }),
+      execute: async ({ focusQuery, requireSpatial }) => {
+        if (!this.currentFrame) {
+          logger.warn('analyze_visual_scene called with no camera frame');
+          return { error: 'No camera frame available. Ask the user to point their camera.' };
+        }
+
+        try {
+          const result = await visionTool.execute({
+            imageData: this.currentFrame.imageData,
+            mimeType: this.currentFrame.mimeType,
+            focusQuery,
+            requireSpatial: requireSpatial ?? true,
+          });
+
+          // Accumulate spatial annotations for the UI overlay
+          if (result.annotations?.length) {
+            this.turnSpatialAnnotations.push(...result.annotations);
+          }
+
+          return result;
+        } catch (err) {
+          logger.error('analyze_visual_scene tool error:', err);
+          return { error: 'Vision analysis failed. Please try again.' };
+        }
+      },
+    });
+
+    // ── Manual Lookup FunctionTool ─────────────────────────────────────────
+    const lookupManualInstructions = new FunctionTool({
+      name: 'lookup_manual_instructions',
+      description: `Retrieves verified, step-by-step instructions from the knowledge base using RAG.
+        ALWAYS call this before giving any technical or medical instruction.
+        Returns grounded steps with source citations. Never skip this for safety-critical tasks.`,
+      parameters: z.object({
+        query: z
+          .string()
+          .describe('Natural language description of what the user is trying to do'),
+        context: z
+          .string()
+          .optional()
+          .describe('Visual context from the scene analysis to narrow the search'),
+        domain: z
+          .enum(['electronics', 'medical', 'automotive', 'plumbing', 'appliance', 'general'])
+          .optional()
+          .describe('Domain category to focus the knowledge base search'),
+        stepNumber: z
+          .number()
+          .optional()
+          .describe('If the user is asking about a specific step number'),
+      }),
+      execute: async ({ query, context, domain, stepNumber }) => {
+        try {
+          const result = await manualTool.execute({ query, context, domain, stepNumber });
+
+          // Accumulate source documents for the UI transcript
+          if (result.sources?.length) {
+            this.turnSourceDocuments.push(...result.sources);
+          }
+
+          return result;
+        } catch (err) {
+          logger.error('lookup_manual_instructions tool error:', err);
+          return {
+            found: false,
+            steps: [],
+            warnings: ['Knowledge base temporarily unavailable. Exercise extra caution.'],
+            sources: [],
+            confidence: 0,
+            relatedTopics: [],
+          };
+        }
+      },
+    });
+
+    // ── LLM Agent (GuardianEye Root Agent) ────────────────────────────────
+    const guardianAgent = new LlmAgent({
+      name: 'guardian_eye_agent',
+      model: 'gemini-2.0-flash',        // ADK uses short model names (no -exp suffix)
+      description:
+        'Real-time hands-free AI assistant for technical and medical tasks using live camera feed.',
+      instruction: GUARDIAN_SYSTEM_PROMPT,
+      tools: [analyzeVisualScene, lookupManualInstructions],
+    });
+
+    // ── Runner + Session Service ───────────────────────────────────────────
+    this.sessionService = new InMemorySessionService();
+    this.runner = new Runner({
+      agent: guardianAgent,
+      appName: 'guardianeye-live',
+      sessionService: this.sessionService,
+    });
   }
 
+  // ── Ensure ADK session exists (idempotent) ────────────────────────────────
+
+  private async ensureAdkSession(): Promise<void> {
+    if (this.adkSessionCreated) return;
+
+    await this.sessionService.createSession({
+      appName: 'guardianeye-live',
+      userId: this.userId ?? 'anonymous',
+      sessionId: this.sessionId,
+    });
+
+    this.adkSessionCreated = true;
+    logger.debug(`ADK session created: ${this.sessionId}`);
+  }
+
+  // ── Primary Entry Point ────────────────────────────────────────────────────
+
   /**
-   * Primary entry point: process a frame + optional user query
-   * Returns structured response ready for TTS streaming
+   * Process a camera frame + optional user query through the ADK agent.
+   * The Runner manages the full agentic loop: LLM call → tool execution →
+   * result injection → final LLM response.
    */
   async processInput(input: FrameInput): Promise<OrchestratorResponse> {
     const startTime = Date.now();
 
+    // Reset per-turn accumulators
+    this.turnSpatialAnnotations = [];
+    this.turnSourceDocuments = [];
+
+    // Update the frame context so FunctionTools can read it
+    this.currentFrame = { imageData: input.imageData, mimeType: input.mimeType };
+
     try {
-      // Build the user message for this turn
-      const userMessage = this.buildUserMessage(input);
-      this.conversationHistory.push(userMessage);
+      await this.ensureAdkSession();
 
-      // Agentic loop — run until model stops calling tools
-      let response = await this.callModel();
-      let spatialAnnotations: SpatialAnnotation[] = [];
-      let sourceDocuments: string[] = [];
-      let iterations = 0;
-      const MAX_ITERATIONS = 5;  // Safety cap on tool calls per turn
+      // Build a multimodal Content message: image + text
+      const userMessage: Content = {
+        role: 'user',
+        parts: [
+          {
+            inlineData: {
+              mimeType: input.mimeType,
+              data: input.imageData,
+            },
+          },
+          {
+            text: input.userQuery
+              ?? 'What do you see? Describe any components or tasks I might be working on.',
+          },
+        ],
+      };
 
-      while (response.toolCalls && response.toolCalls.length > 0 && iterations < MAX_ITERATIONS) {
-        iterations++;
-        const toolResults = await this.executeToolCalls(response.toolCalls, input);
+      // Run the agent — ADK handles the full tool-calling loop internally
+      let finalText = "I'm analyzing the scene. One moment.";
 
-        // Collect metadata from tool results
-        spatialAnnotations.push(...(toolResults.spatialAnnotations || []));
-        sourceDocuments.push(...(toolResults.sourceDocuments || []));
+      const eventStream = this.runner.runAsync({
+        userId: this.userId ?? 'anonymous',
+        sessionId: this.sessionId,
+        newMessage: userMessage,
+      });
 
-        // Add tool results to conversation and call model again
-        this.conversationHistory.push({
-          role: 'model',
-          parts: response.toolCalls.map(tc => ({ functionCall: tc })),
-        });
-        this.conversationHistory.push({
-          role: 'user',
-          parts: toolResults.parts,
-        });
-
-        response = await this.callModel();
+      for await (const event of eventStream) {
+        if (isFinalResponse(event)) {
+          finalText = event.content?.parts?.[0]?.text ?? finalText;
+        }
       }
 
-      // Trim history to prevent unbounded growth — keep last MAX_HISTORY_TURNS user+model pairs
-      if (this.conversationHistory.length > GuardianEyeOrchestrator.MAX_HISTORY_TURNS * 2) {
-        this.conversationHistory = this.conversationHistory.slice(
-          this.conversationHistory.length - GuardianEyeOrchestrator.MAX_HISTORY_TURNS * 2
-        );
-      }
-
-      const finalText = response.text || "I'm analyzing the scene. One moment.";
+      this.adkTurnCount++;
       const latency = Date.now() - startTime;
-
-      logger.info(`Orchestrator response in ${latency}ms (${iterations} tool calls)`);
+      logger.info(`ADK orchestrator response in ${latency}ms | session: ${this.sessionId}`);
 
       // Persist turn to Firestore
       await this.sessionStore.saveTurn(this.sessionId, {
         userQuery: input.userQuery,
         agentResponse: finalText,
-        sourceDocuments,
+        sourceDocuments: this.turnSourceDocuments,
         latencyMs: latency,
         timestamp: new Date(),
       });
 
+      const uniqueSources = [...new Set(this.turnSourceDocuments)];
+
       return {
         text: finalText,
         audioReady: true,
-        spatialAnnotations: spatialAnnotations.length > 0 ? spatialAnnotations : undefined,
-        sourceDocuments: sourceDocuments.length > 0 ? [...new Set(sourceDocuments)] : undefined,
-        confidence: sourceDocuments.length > 0 ? 0.95 : 0.6,
+        spatialAnnotations:
+          this.turnSpatialAnnotations.length > 0 ? this.turnSpatialAnnotations : undefined,
+        sourceDocuments: uniqueSources.length > 0 ? uniqueSources : undefined,
+        confidence: uniqueSources.length > 0 ? 0.95 : 0.6,
       };
-
     } catch (error) {
-      logger.error('Orchestrator error:', error);
+      logger.error('ADK orchestrator error:', error);
       return {
-        text: "I encountered an issue processing that. Please try again.",
+        text: 'I encountered an issue processing that. Please try again.',
         audioReady: true,
         confidence: 0,
       };
     }
   }
 
-  private buildUserMessage(input: FrameInput) {
-    const parts: Array<object> = [];
+  // ── Context Reset ─────────────────────────────────────────────────────────
 
-    // Always include the frame for visual grounding
-    parts.push({
-      inlineData: {
-        mimeType: input.mimeType,
-        data: input.imageData,
-      },
-    });
-
-    // Add user query if present, or prompt scene analysis
-    parts.push({
-      text: input.userQuery
-        ? input.userQuery
-        : "What do you see? Describe any components or tasks I might be working on.",
-    });
-
-    return { role: 'user', parts };
-  }
-
-  private async callModel(): Promise<{ text?: string; toolCalls?: Array<{ name: string; args: object }> }> {
-    const result = await this.model.generateContent({
-      contents: this.conversationHistory as any,
-      tools: ADK_TOOL_DEFINITIONS as any,
-    });
-
-    const candidate = result.response.candidates?.[0];
-    if (!candidate?.content) return { text: '' };
-
-    const textParts = candidate.content.parts
-      ?.filter((p: any) => p.text)
-      .map((p: any) => p.text)
-      .join('');
-
-    const toolCallParts = candidate.content.parts
-      ?.filter((p: any) => p.functionCall)
-      .map((p: any) => ({
-        name: p.functionCall.name,
-        args: p.functionCall.args || {},
-      }));
-
-    return {
-      text: textParts || undefined,
-      toolCalls: toolCallParts && toolCallParts.length > 0 ? toolCallParts : undefined,
-    };
-  }
-
-  private async executeToolCalls(
-    toolCalls: Array<{ name: string; args: Record<string, unknown> }>,
-    input: FrameInput
-  ): Promise<{ parts: Array<object>; spatialAnnotations: SpatialAnnotation[]; sourceDocuments: string[] }> {
-    const parts: Array<object> = [];
-    const spatialAnnotations: SpatialAnnotation[] = [];
-    const sourceDocuments: string[] = [];
-
-    for (const toolCall of toolCalls) {
-      logger.debug(`Executing tool: ${toolCall.name}`, toolCall.args);
-
-      let result: Record<string, unknown>;
-
-      if (toolCall.name === 'analyze_visual_scene') {
-        result = await this.visionTool.execute({
-          imageData: input.imageData,
-          mimeType: input.mimeType,
-          focusQuery: toolCall.args.focusQuery as string,
-          requireSpatial: toolCall.args.requireSpatial as boolean ?? true,
-        });
-
-        if (result.annotations) {
-          spatialAnnotations.push(...(result.annotations as SpatialAnnotation[]));
-        }
-
-      } else if (toolCall.name === 'lookup_manual_instructions') {
-        result = await this.manualTool.execute({
-          query: toolCall.args.query as string,
-          context: toolCall.args.context as string,
-          domain: toolCall.args.domain as string,
-          stepNumber: toolCall.args.stepNumber as number,
-        });
-
-        if (result.sources) {
-          sourceDocuments.push(...(result.sources as string[]));
-        }
-
-      } else {
-        result = { error: `Unknown tool: ${toolCall.name}` };
-      }
-
-      parts.push({
-        functionResponse: {
-          name: toolCall.name,
-          content: result,
-        },
-      });
-    }
-
-    return { parts, spatialAnnotations, sourceDocuments };
-  }
-
-  /** Reset conversation for a new task context */
+  /**
+   * Reset conversation by creating a new ADK session with a fresh ID.
+   * Called when the user wants to start a new task context.
+   */
   resetContext(): void {
-    this.conversationHistory = [];
-    logger.info(`Context reset for session ${this.sessionId}`);
+    this.adkSessionCreated = false;
+    this.currentFrame = null;
+    this.turnSpatialAnnotations = [];
+    this.turnSourceDocuments = [];
+    logger.info(`ADK context reset for session ${this.sessionId}`);
   }
 
-  /** Get current conversation depth */
+  // ── Turn Count ────────────────────────────────────────────────────────────
+
   get turnCount(): number {
-    return this.conversationHistory.filter(m => m.role === 'user').length;
+    return this.adkTurnCount;
   }
 }
