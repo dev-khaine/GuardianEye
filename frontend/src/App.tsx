@@ -13,10 +13,11 @@ import { ControlBar } from './components/ControlBar';
 import './styles/globals.css';
 
 export default function App() {
-  const { status, sessionId, isConnected } = useGuardianStore();
-  const { connect, disconnect, sendText, interrupt } = useWebSocket();
+  const { sessionId, isConnected } = useGuardianStore();
+  const { connect, disconnect, sendText, sendAudioChunk, interrupt } = useWebSocket();
   const { videoRef, startCamera, stopCamera, captureFrame, isCameraActive } = useCamera();
-  const { startRecording, stopRecording, isRecording } = useAudio();
+  // Pass sendAudioChunk so useAudio uses the same WebSocket connection
+  const { startRecording, stopRecording, isRecording } = useAudio(sendAudioChunk);
 
   const frameIntervalRef = useRef<ReturnType<typeof setInterval>>();
 
@@ -25,7 +26,6 @@ export default function App() {
     await startCamera();
     await startRecording();
 
-    // Stream frames at 1fps for analysis (higher rate for context is handled in WS hook)
     frameIntervalRef.current = setInterval(() => {
       const frame = captureFrame();
       if (frame) {
@@ -52,7 +52,6 @@ export default function App() {
 
   return (
     <div className="guardian-app">
-      {/* Ambient background */}
       <div className="bg-atmosphere" />
 
       <header className="guardian-header">
@@ -79,16 +78,13 @@ export default function App() {
       </header>
 
       <main className="guardian-main">
-        {/* Left: Live Viewfinder */}
         <section className="viewfinder-panel">
           <div className="viewfinder-wrapper">
             <Viewfinder videoRef={videoRef} isActive={isCameraActive} />
             <SpatialOverlay />
-            {/* Scanline effect */}
             <div className="scanline-overlay" />
           </div>
 
-          {/* Camera controls */}
           <ControlBar
             isActive={isConnected}
             isRecording={isRecording}
@@ -99,13 +95,11 @@ export default function App() {
           />
         </section>
 
-        {/* Right: Transcript + Info */}
         <section className="transcript-panel">
           <TranscriptLog />
         </section>
       </main>
 
-      {/* Emergency Stop — always visible when connected */}
       <AnimatePresence>
         {isConnected && (
           <EmergencyStop onStop={handleEmergencyStop} />

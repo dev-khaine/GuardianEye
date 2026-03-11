@@ -1,11 +1,8 @@
-// useAudio.ts — Microphone capture with VAD
 import { useRef, useState, useCallback } from 'react';
-import { useWebSocket } from './useWebSocket';
 
-export function useAudio() {
+export function useAudio(sendAudioChunk: (data: string) => void) {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const [isRecording, setIsRecording] = useState(false);
-  const { sendAudioChunk } = useWebSocket();
 
   const startRecording = useCallback(async () => {
     try {
@@ -26,7 +23,6 @@ export function useAudio() {
 
       mediaRecorder.ondataavailable = async (event) => {
         if (event.data.size > 0) {
-          // Convert blob to base64 for WebSocket transmission
           const buffer = await event.data.arrayBuffer();
           const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
           sendAudioChunk(base64);
